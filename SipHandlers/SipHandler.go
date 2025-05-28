@@ -13,20 +13,40 @@ type SipHandler struct {
 	Logger log.Logger
 }
 
-func (h *SipHandler) extractBranch(req sip.Request) string {
+// Used
+func (h *SipHandler) extractBranch(req sip.Request) (string, sip.Response, error) {
 	via, ok := req.ViaHop()
 	if !ok {
-		h.Logger.Warn("No Via header found in request")
-		return ""
+		constructedResponse := h.buildSipResponse(
+			"",
+			req,
+			400,
+			"Bad Request",
+			"",
+			&sip.GenericHeader{
+				HeaderName: "Reason",
+				Contents:   "Missing Via header",
+			},
+		)
+		return "", constructedResponse, errors.New("missing Via header in request")
 	}
 
 	branch, exists := via.Params.Get("branch")
 	if !exists {
-		h.Logger.Warn("Branch parameter does not set")
-		return ""
+		constructedResponse := h.buildSipResponse(
+			"",
+			req,
+			400,
+			"Bad Request",
+			"",
+			&sip.GenericHeader{
+				HeaderName: "Reason",
+				Contents:   "Missing branch in Via",
+			},
+		)
+		return "", constructedResponse, errors.New("missing branch parameter in Via header")
 	}
-
-	return branch.String()
+	return branch.String(), nil, nil
 }
 
 func (h *SipHandler) buildSipResponse(
@@ -47,6 +67,7 @@ func (h *SipHandler) buildSipResponse(
 	return result
 }
 
+// Used
 func (h *SipHandler) validateRegisterUserNameMatches(req sip.Request) (string, sip.Response, error) {
 	fromHeader, ok := req.From()
 	if !ok {
@@ -122,38 +143,74 @@ func (h *SipHandler) respondToRequest(constructedResponse sip.Response, tx sip.S
 	}
 }
 
-func (h *SipHandler) extractIpAndPort(req sip.Request) (string, string, sip.Response, error) {
-	contactHeaders := req.GetHeaders("Contact")
-	if len(contactHeaders) == 0 {
-		h.Logger.Warn("missing Contact header")
-		res := sip.NewResponseFromRequest("", req, 400, "Bad Request", "")
-		res.AppendHeader(&sip.GenericHeader{
+func (h *SipHandler) extractIpAndPort(req sip.Request) (sip.Uri, sip.Response, error) {
+	contact, success := req.Contact()
+	if !success {
+		constructedResponse := h.buildSipResponse("", req, 400, "Bad Request", "", &sip.GenericHeader{
 			HeaderName: "Reason",
-			Contents:   "No contact specified in Headers",
+			Contents:   "Cannot extract the contact header",
 		})
-		tx.Respond(res)
-		return
+		return nil, constructedResponse, errors.New("error extracting contact header")
+	}
+	clientContactUriContact := contact.Address
+	return clientContactUriContact, nil, nil
+}
+
+func (h *SipHandler) extractCSeqNumber(req sip.Request) (uint32, sip.Response, error) {
+	cseq, success := req.CSeq()
+	if !success {
+		constructedResponse := h.buildSipResponse("", req, 400, "Bad Request", "", &sip.GenericHeader{
+			HeaderName: "Reason",
+			Contents:   "Cannot extract the cseq number",
+		})
+		return 0, constructedResponse, errors.New("error extracting cseq header")
+	}
+	num := cseq.SeqNo
+	return num, nil, nil
+}
+
+func (h *SipHandler) parseRegistrationRequest(req sip.Request) (RegisterData, sip.Response, error) {
+	uuidGenerated, err := uuid.NewV4()
+	if err != nil {
+		return RegisterData{}, nil, errors.New("failed to generate UUID")
 	}
 
-	contact, ok := contactHeaders[0].(*sip.ContactHeader)
-	if !ok {
-		logger.Warn("invalid Contact header")
-		res := sip.NewResponseFromRequest("", req, 400, "Bad Request", "")
-		res.AppendHeader(&sip.GenericHeader{
-			HeaderName: "Reason",
-			Contents:   "invalid contact header",
-		})
-		tx.Respond(res)
-		return
+	// Constructing, adding the generated ToTag
+	registerData := RegisterData{
+		ToTag: uuidGenerated.String(),
 	}
 
-	contactURI := contact.Address
-	ip := contactURI.Host()
-	port := "5060" // Default SIP port
-	if contactURI.Port() != nil {
-		port = fmt.Sprintf("%d", *contactURI.Port())
+	// extracting the branch
+	branch, response, err := h.extractBranch(req)
+	if err != nil {
+		return RegisterData{}, response, err
 	}
-	return "", "", nil
+	registerData.Branch = branch
+
+	// extracting the username
+	usernameString, response, err := h.validateRegisterUserNameMatches(req)
+	if err != nil {
+		return RegisterData{}, response, err
+	}
+	registerData.Username = usernameString
+
+	// extracting the contactUri
+	contactUri, response, err := h.extractIpAndPort(req)
+	if err != nil {
+		return RegisterData{}, response, err
+	}
+	registerData.ClientContactUri = contactUri
+
+	// extracting CSeqNumber
+	num, response, err := h.extractCSeqNumber(req)
+	if err != nil {
+		return RegisterData{}, response, err
+	}
+	registerData.CSeqNumber = num
+
+	//  extracting the call id
+
+	return registerData, nil, nil
 }
 
 func (h *SipHandler) handleRegisterRequest(req sip.Request, tx sip.ServerTransaction) {
@@ -161,17 +218,7 @@ func (h *SipHandler) handleRegisterRequest(req sip.Request, tx sip.ServerTransac
 
 	branch := h.extractBranch(req)
 	if branch == "" {
-		constructedResponse := h.buildSipResponse(
-			"",
-			req,
-			400,
-			"Bad Request",
-			"",
-			&sip.GenericHeader{
-				HeaderName: "Reason",
-				Contents:   "Missing branch parameter in Via header",
-			},
-		)
+
 		h.respondToRequest(constructedResponse, tx)
 		h.Logger.Warn("Missing branch parameter in Via header")
 		return
