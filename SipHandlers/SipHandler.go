@@ -1,19 +1,27 @@
 package SipHandlers
 
 import (
+	"SipServe/MyHandlers"
+	"context"
 	"errors"
-	"fmt"
 	"github.com/ghettovoice/gosip/log"
 	"github.com/ghettovoice/gosip/sip"
+	"github.com/redis/go-redis/v9"
 	"github.com/satori/go.uuid"
-	"strconv"
 )
 
 type SipHandler struct {
 	Logger log.Logger
+	Client *redis.Client
+	Ctx    context.Context
 }
 
-// Used
+type ParseReturn struct {
+	RegData RegisterData
+	Resp    sip.Response
+	Err     error
+}
+
 func (h *SipHandler) extractBranch(req sip.Request) (string, sip.Response, error) {
 	via, ok := req.ViaHop()
 	if !ok {
@@ -68,7 +76,7 @@ func (h *SipHandler) buildSipResponse(
 }
 
 // Used
-func (h *SipHandler) validateRegisterUserNameMatches(req sip.Request) (string, sip.Response, error) {
+func (h *SipHandler) validateRegisterUserNameMatchesAndExtract(req sip.Request) (string, sip.Response, error) {
 	fromHeader, ok := req.From()
 	if !ok {
 		constructedResponse := h.buildSipResponse(
@@ -169,6 +177,38 @@ func (h *SipHandler) extractCSeqNumber(req sip.Request) (uint32, sip.Response, e
 	return num, nil, nil
 }
 
+func (h *SipHandler) extractCallUUID(req sip.Request) (string, sip.Response, error) {
+	callid, success := req.CallID()
+	if !success {
+		constructedResponse := h.buildSipResponse("", req, 400, "Bad Request", "", &sip.GenericHeader{
+			HeaderName: "Reason",
+			Contents:   "Cannot extract the callid",
+		})
+		return "", constructedResponse, errors.New("cannot extract the callid")
+	}
+	return callid.Value(), nil, nil
+}
+
+func (h *SipHandler) extractFromTag(req sip.Request) (string, sip.Response, error) {
+	fromHeader, success := req.From()
+	if !success {
+		constructedResponse := h.buildSipResponse("", req, 400, "Bad Request", "", &sip.GenericHeader{
+			HeaderName: "Reason",
+			Contents:   "Cannot extract the from",
+		})
+		return "", constructedResponse, errors.New("cannot extract the from header")
+	}
+	fromTag, success := fromHeader.Params.Get("tag")
+	if !success {
+		constructedResponse := h.buildSipResponse("", req, 400, "Bad Request", "", &sip.GenericHeader{
+			HeaderName: "Reason",
+			Contents:   "Cannot extract the tag from From header",
+		})
+		return "", constructedResponse, errors.New("cannot extract the tag from From header")
+	}
+	return fromTag.String(), nil, nil
+}
+
 func (h *SipHandler) parseRegistrationRequest(req sip.Request) (RegisterData, sip.Response, error) {
 	uuidGenerated, err := uuid.NewV4()
 	if err != nil {
@@ -188,7 +228,7 @@ func (h *SipHandler) parseRegistrationRequest(req sip.Request) (RegisterData, si
 	registerData.Branch = branch
 
 	// extracting the username
-	usernameString, response, err := h.validateRegisterUserNameMatches(req)
+	usernameString, response, err := h.validateRegisterUserNameMatchesAndExtract(req)
 	if err != nil {
 		return RegisterData{}, response, err
 	}
@@ -209,120 +249,55 @@ func (h *SipHandler) parseRegistrationRequest(req sip.Request) (RegisterData, si
 	registerData.CSeqNumber = num
 
 	//  extracting the call id
+	callid, response, err := h.extractCallUUID(req)
+	if err != nil {
+		return RegisterData{}, response, err
+	}
+	registerData.CallUUID = callid
 
+	// extracting the `from tag`
+	tagFrom, response, err := h.extractFromTag(req)
+	if err != nil {
+		return RegisterData{}, response, err
+	}
+	registerData.FromTag = tagFrom
+	registerData.Content = req.Body()
 	return registerData, nil, nil
 }
 
-func (h *SipHandler) handleRegisterRequest(req sip.Request, tx sip.ServerTransaction) {
+func (h *SipHandler) HandleRegisterRequest(req sip.Request, tx sip.ServerTransaction) {
 	h.Logger.Infof("Received SIP %s request for %s", req.Method(), req.Recipient())
 
-	branch := h.extractBranch(req)
-	if branch == "" {
+	parsing := make(chan ParseReturn)
+	go func() {
+		parsed, response, err := h.parseRegistrationRequest(req)
+		parsing <- ParseReturn{RegData: parsed, Resp: response, Err: err}
+	}()
 
-		h.respondToRequest(constructedResponse, tx)
-		h.Logger.Warn("Missing branch parameter in Via header")
-		return
-	}
+	result := <-parsing
 
-	// validating if name matches in all the request
-	// extract the username
-	username, constructedResponse, err := h.validateRegisterUserNameMatches(req)
-	if err != nil {
-		h.respondToRequest(constructedResponse, tx)
-		return
-	}
-
-	// ip and port
-
-	/*
-		contactHeaders := req.GetHeaders("Contact")
-			if len(contactHeaders) == 0 {
-				logger.Warn("missing Contact header")
-				res := sip.NewResponseFromRequest("", req, 400, "Bad Request", "")
-				res.AppendHeader(&sip.GenericHeader{
-					HeaderName: "Reason",
-					Contents:   "No contact specified in Headers",
-				})
-				tx.Respond(res)
-				return
-			}
-
-			contact, ok := contactHeaders[0].(*sip.ContactHeader)
-			if !ok {
-				logger.Warn("invalid Contact header")
-				res := sip.NewResponseFromRequest("", req, 400, "Bad Request", "")
-				res.AppendHeader(&sip.GenericHeader{
-					HeaderName: "Reason",
-					Contents:   "invalid contact header",
-				})
-				tx.Respond(res)
-				return
-			}
-
-			contactURI := contact.Address
-			ip := contactURI.Host()
-			port := "5060" // Default SIP port
-			if contactURI.Port() != nil {
-				port = fmt.Sprintf("%d", *contactURI.Port())
-			}
-	*/
-
-	// expires
-	expires := 3600 // Default
-
-	if hdr := req.GetHeaders("Expires"); hdr != nil {
-		if expVal, ok := hdr[0].(*sip.Expires); ok {
-			expires = int(*expVal)
+	if result.Err != nil {
+		h.Logger.Warnf("%s", result.Err.Error())
+		err := tx.Respond(result.Resp)
+		if err != nil {
+			h.Logger.Warn("Failed to respond to the request")
 		}
-	} else if expParam, ok := contact.Params.Get("expires"); ok {
-		expires, _ = strconv.Atoi(expParam.String())
+		return
 	}
+	registeredData := result.RegData
 
-	err := StoreOrUpdateUserInRedis(username, ip, port, expires)
+	err := MyHandlers.StoreOrUpdateUserInRedis(h.Ctx, h.Client,
+		registeredData.Username,
+		registeredData.ClientContactUri.Host(),
+		registeredData.ClientContactUri.Port().String())
 	if err != nil {
-		logger.Errorf("Failed to store user in Redis: %v", err)
+		h.Logger.Errorf("Failed to store user in Redis: %v", err)
 	}
 
-	res := sip.NewResponseFromRequest("", req, 200, "OK", "")
+	res := h.buildSipResponse("", req, 200, "OK", "")
 
-	contactHeader, ok := req.Contact()
-	if !ok {
-		res := sip.NewResponseFromRequest("", req, 400, "Bad Request", "")
-		res.AppendHeader(&sip.GenericHeader{
-			HeaderName: "Reason",
-			Contents:   "Missing Contact parameter",
-		})
-		tx.Respond(res)
-		return
-	}
-	res.AppendHeader(contactHeader)
-
-	toHeaders := req.GetHeaders("To")
-	if len(toHeaders) == 0 {
-		fmt.Println("No To headers found")
-		return
-	}
-
-	oldTo, ok := toHeaders[0].(*sip.ToHeader)
-	if !ok {
-		fmt.Println("Failed to cast To header")
-		return
-	}
-
-	newTag, _ := uuid.NewV4()
-	newParams := sip.NewParams().Add("tag", sip.String{Str: newTag.String()})
-
-	newToHeader := &sip.ToHeader{
-		Address: oldTo.Address,
-		Params:  newParams,
-	}
-
-	res.RemoveHeader("To")
-	res.AppendHeader(newToHeader)
-
-	logger.Infof("SIP reply:\n%s", res.String())
-
+	h.Logger.Infof("SIP reply:\n%s", res.String())
 	if err := tx.Respond(res); err != nil {
-		logger.Errorf("Failed to send SIP response: %v", err)
+		h.Logger.Errorf("Failed to send SIP response: %v", err)
 	}
 }

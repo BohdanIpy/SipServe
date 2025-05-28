@@ -1,27 +1,23 @@
 package main
 
 import (
+	"SipServe/MyHandlers"
+	"SipServe/SipHandlers"
 	"context"
 	"fmt"
-	"github.com/redis/go-redis/v9"
-	"net"
-	"os"
-	"os/signal"
-	"strconv"
-	"syscall"
-	"time"
-
-	uuid "github.com/satori/go.uuid"
-
-	"SipServe/MyHandlers"
 	"github.com/ghettovoice/gosip"
 	"github.com/ghettovoice/gosip/log"
 	"github.com/ghettovoice/gosip/sip"
 	"github.com/ghettovoice/gosip/transaction"
 	"github.com/ghettovoice/gosip/transport"
+	"github.com/redis/go-redis/v9"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
-func InitRedis() *redis.Client {
+func InitRedis(ctx context.Context) *redis.Client {
 
 	redisClientOption := redis.Options{
 		Addr:     "localhost:6379",
@@ -38,36 +34,9 @@ func InitRedis() *redis.Client {
 	return redisClient
 }
 
-func StoreOrUpdateUserInRedis(user string, ip string, port string, expires int) error {
-	key := fmt.Sprintf("user:%s", user)
-
-	data := map[string]interface{}{
-		"ip":     ip,
-		"port":   port,
-		"expiry": time.Now().Add(time.Duration(expires) * time.Second).Unix(),
-	}
-
-	if err := redisClient.HSet(ctx, key, data).Err(); err != nil {
-		return err
-	}
-
-	exists, err := redisClient.Exists(ctx, key).Result()
-	if err != nil {
-		return err
-	}
-
-	if exists == 1 {
-		return redisClient.Expire(ctx, key, 2*time.Duration(expires)*time.Second).Err()
-	}
-
-	return nil
-}
-
-func GetUserFromRedis(user string) (map[string]string, error) {
+/*func GetUserFromRedis(user string) (map[string]string, error) {
 	return redisClient.HGetAll(ctx, fmt.Sprintf("user:%s", user)).Result()
-}
-
-type SIPHandler struct{}
+}*/
 
 /*func (h *SIPHandler) handleInviteRequest(req sip.Request, logger log.Logger, transportLayer transport.Layer) {
 	toHeader, ok := req.To()
@@ -126,7 +95,7 @@ func main() {
 	logger := log.NewDefaultLogrusLogger().WithPrefix("SIP-Server")
 
 	handlers := MyHandlers.AsyncHandlers{
-		RedisClient: InitRedis(),
+		RedisClient: InitRedis(context.Background()),
 		Logger:      logger,
 		Ctx:         context.Background(),
 	}
@@ -154,8 +123,13 @@ func main() {
 		logger,
 	)
 
-	handler := &SIPHandler{}
-	if err := srv.OnRequest(sip.REGISTER, handler.HandleRegisterRequest); err != nil {
+	mySipHandler := &SipHandlers.SipHandler{
+		Logger: logger,
+		Client: handlers.RedisClient,
+		Ctx:    handlers.Ctx,
+	}
+
+	if err := srv.OnRequest(sip.REGISTER, mySipHandler.HandleRegisterRequest); err != nil {
 		logger.Errorf("Failed to register request handler: %v", err)
 		return
 	}

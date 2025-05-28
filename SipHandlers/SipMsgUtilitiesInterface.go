@@ -10,4 +10,5 @@ type SipMsgUtilities interface {
 	extractIpAndPort(req sip.Request) (sip.Uri, sip.Response, error)
 	extractCSeqNumber(req sip.Request) (uint32, sip.Response, error)
 	extractCallUUID(req sip.Request) (string, sip.Response, error)
+	extractFromTag(req sip.Request) (string, sip.Response, error)
 }
